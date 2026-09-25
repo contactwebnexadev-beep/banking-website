@@ -1,0 +1,6 @@
+{
+  "name": "Bank of America Online Banking",
+  "description": "Full-stack online banking portal inspired by Bank of America, featuring secure two-step verification, multi-account overview, USD transfers, transaction history, and isolated role-based admin management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
