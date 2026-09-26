@@ -38,7 +38,13 @@ export async function safeParseResponse<T = any>(res: Response): Promise<SafeApi
   }
 
   if (!res.ok) {
-    error = data?.error || error || `Request failed with status code ${res.status}.`;
+    const responseError = data?.error;
+    const responseMessage = typeof responseError === 'string'
+      ? responseError
+      : typeof responseError?.message === 'string'
+        ? responseError.message
+        : undefined;
+    error = responseMessage || error || `Request failed with status code ${res.status}.`;
   }
 
   return {

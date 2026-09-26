@@ -1,10 +1,12 @@
 import { Router, Response, Request } from 'express';
-import { get, run } from '../db.js';
+import { VerificationCode } from '../models.js';
+import { errorMessage, requireDatabase } from '../db.js';
 
 const router = Router();
+router.use(requireDatabase);
 
 // POST /api/verify/validate-otp
-router.post('/validate-otp', (req: Request, res: Response): void => {
+router.post('/validate-otp', async (req: Request, res: Response): Promise<void> => {
   try {
     const { verificationId, code } = req.body;
     if (!verificationId || !code) {
@@ -12,10 +14,9 @@ router.post('/validate-otp', (req: Request, res: Response): void => {
       return;
     }
 
-    const record = get<any>(
-      'SELECT * FROM verification_codes WHERE id = ? AND verified = 0 AND expires_at > ?',
-      [verificationId, Date.now()]
-    );
+    const record = await VerificationCode.findOne({
+      id: verificationId, verified: false, expires_at: { $gt: Date.now() },
+    }).lean<any>();
 
     if (!record) {
       res.status(400).json({ valid: false, error: 'Authorization code has expired or does not exist.' });
@@ -33,18 +34,16 @@ router.post('/validate-otp', (req: Request, res: Response): void => {
       message: 'Code successfully verified.',
     });
   } catch (err: any) {
-    res.status(500).json({ valid: false, error: 'Verification check failed.' });
+    res.status(500).json({ valid: false, error: errorMessage(err, 'Verification check failed.') });
   }
 });
 
 // GET /api/verify/info/:id
-router.get('/info/:id', (req: Request, res: Response): void => {
+router.get('/info/:id', async (req: Request, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const record = get<any>(
-      'SELECT id, purpose, email, phone, expires_at, verified, created_at FROM verification_codes WHERE id = ?',
-      [id]
-    );
+    const record = await VerificationCode.findOne({ id })
+      .select('id purpose email phone expires_at verified created_at').lean<any>();
 
     if (!record) {
       res.status(404).json({ error: 'Verification session not found.' });
@@ -58,7 +57,7 @@ router.get('/info/:id', (req: Request, res: Response): void => {
       verified: record.verified === 1,
     });
   } catch (err: any) {
-    res.status(500).json({ error: 'Failed to inspect verification.' });
+    res.status(500).json({ error: errorMessage(err, 'Failed to inspect verification.') });
   }
 });
 

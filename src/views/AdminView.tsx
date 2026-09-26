@@ -351,7 +351,7 @@ export const AdminView: React.FC<AdminViewProps> = ({ user, token, onSignOut }) 
               Bank of America Core Systems & Ledger Management
             </h1>
             <p className="text-xs text-slate-300">
-              Authorized Administrator: <span className="font-mono text-white">{user.email}</span> | SQLite Persistent Storage Active
+              Authorized Administrator: <span className="font-mono text-white">{user.email}</span> | MongoDB Atlas Storage
             </p>
           </div>
         </div>

@@ -1,12 +1,14 @@
 import { Router, Response } from 'express';
-import { get, run } from '../db.js';
+import { Account, Transaction } from '../models.js';
+import { errorMessage, requireDatabase } from '../db.js';
 import { requireAuth, AuthenticatedRequest } from '../auth.js';
 
 const router = Router();
+router.use(requireDatabase);
 
 // POST /api/accounts/deposit
 // Creates a PENDING deposit transaction awaiting admin approval
-router.post('/deposit', requireAuth, (req: AuthenticatedRequest, res: Response): void => {
+router.post('/deposit', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
     const { institutionName, accountNumber, amount, targetAccountId } = req.body || {};
@@ -23,20 +25,14 @@ router.post('/deposit', requireAuth, (req: AuthenticatedRequest, res: Response):
     // Find destination account belonging to this user
     let targetAccount: any = null;
     if (targetAccountId) {
-      targetAccount = get<any>('SELECT * FROM accounts WHERE id = ? AND user_id = ?', [targetAccountId, userId]);
+      targetAccount = await Account.findOne({ id: targetAccountId, user_id: userId }).lean<any>();
     }
 
     if (!targetAccount) {
       // Pick primary checking or first account
-      targetAccount = get<any>(
-        `SELECT * FROM accounts WHERE user_id = ? ORDER BY 
-          CASE account_type 
-            WHEN 'Checking' THEN 1 
-            WHEN 'Savings' THEN 2 
-            ELSE 3 
-          END ASC LIMIT 1`,
-        [userId]
-      );
+      const accounts = await Account.find({ user_id: userId }).sort({ created_at: 1 }).lean<any[]>();
+      accounts.sort((a, b) => ({ Checking: 1, Savings: 2 }[a.account_type as 'Checking' | 'Savings'] || 3) - ({ Checking: 1, Savings: 2 }[b.account_type as 'Checking' | 'Savings'] || 3));
+      targetAccount = accounts[0] || null;
     }
 
     if (!targetAccount) {
@@ -57,23 +53,13 @@ router.post('/deposit', requireAuth, (req: AuthenticatedRequest, res: Response):
       status: 'PENDING',
     });
 
-    run(
-      `INSERT INTO transactions (id, user_id, account_id, type, amount, currency, description, recipient_name, recipient_account, status, category, date, created_at)
-       VALUES (?, ?, ?, 'DEPOSIT', ?, 'USD', ?, ?, ?, 'PENDING', 'Deposit', ?, ?)`,
-      [
-        txId,
-        userId,
-        accountId,
-        parsedAmount,
-        txDescription,
-        cleanInstitution || 'External Account',
-        cleanAccountNum ? `External ...${cleanAccountNum.slice(-4)}` : 'External Account',
-        today,
-        Date.now(),
-      ]
-    );
-
-    const newTx = get<any>('SELECT * FROM transactions WHERE id = ?', [txId]);
+    const newTx = await Transaction.create({
+      id: txId, user_id: userId, account_id: accountId,
+      type: 'DEPOSIT', amount: parsedAmount, currency: 'USD', description: txDescription,
+      recipient_name: cleanInstitution || 'External Account',
+      recipient_account: cleanAccountNum ? `External ...${cleanAccountNum.slice(-4)}` : 'External Account',
+      status: 'PENDING', category: 'Deposit', date: today, created_at: Date.now(),
+    });
     console.log('New Deposit Inserted:', newTx);
 
     res.status(200).json({
@@ -94,7 +80,7 @@ router.post('/deposit', requireAuth, (req: AuthenticatedRequest, res: Response):
     });
   } catch (err: any) {
     console.error('Deposit Error:', err);
-    res.status(500).json({ error: 'Failed to process deposit.' });
+    res.status(500).json({ error: errorMessage(err, 'Failed to process deposit.') });
   }
 });
 

@@ -1,16 +1,17 @@
 import { Router, Response } from 'express';
 import bcrypt from 'bcryptjs';
-import { query, get, run } from '../db.js';
+import { User, Account, Transaction, AuditLog } from '../models.js';
+import { errorMessage, requireDatabase } from '../db.js';
 import { requireAdmin, AuthenticatedRequest } from '../auth.js';
 
 const router = Router();
 
-// Apply requireAdmin middleware to all routes in this router
+router.use(requireDatabase);
 router.use(requireAdmin);
 
 // POST /api/admin/create-admin
 // Creates an administrator using an existing administrator session.
-router.post('/create-admin', (req: AuthenticatedRequest, res: Response): void => {
+router.post('/create-admin', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { email, password, passcode, fullName, phone } = req.body || {};
     const cleanEmail = String(email || '').trim().toLowerCase();
@@ -26,17 +27,16 @@ router.post('/create-admin', (req: AuthenticatedRequest, res: Response): void =>
       res.status(400).json({ error: 'Passcode must be at least 6 characters.' });
       return;
     }
-    if (get<any>('SELECT id FROM users WHERE LOWER(email) = ?', [cleanEmail])) {
+    if (await User.exists({ email: cleanEmail })) {
       res.status(409).json({ error: 'An account already exists for this email.' });
       return;
     }
 
     const id = 'usr_admin_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
-    run(
-      `INSERT INTO users (id, email, password_hash, full_name, role, phone, created_at)
-       VALUES (?, ?, ?, ?, 'ADMIN', ?, ?)`,
-      [id, cleanEmail, bcrypt.hashSync(cleanPassword, 10), cleanName, cleanPhone, new Date().toISOString()]
-    );
+    await User.create({
+      id, email: cleanEmail, password_hash: bcrypt.hashSync(cleanPassword, 10),
+      full_name: cleanName, role: 'ADMIN', phone: cleanPhone, created_at: new Date().toISOString(),
+    });
 
     res.status(201).json({
       success: true,
@@ -44,60 +44,58 @@ router.post('/create-admin', (req: AuthenticatedRequest, res: Response): void =>
     });
   } catch (err: any) {
     console.error('Admin creation error:', err);
-    res.status(500).json({ error: 'Failed to create administrator account.' });
+    res.status(500).json({ error: errorMessage(err, 'Failed to create administrator account.') });
   }
 });
 
 // GET /api/admin/overview
-router.get('/overview', (req: AuthenticatedRequest, res: Response): void => {
+router.get('/overview', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const totalUsers = get<any>("SELECT count(*) as count FROM users WHERE role = 'user'")?.count || 0;
-    const totalAccounts = get<any>("SELECT count(*) as count FROM accounts")?.count || 0;
-    const totalDeposits = get<any>("SELECT SUM(balance) as sum FROM accounts WHERE account_type != 'Credit Card'")?.sum || 0;
-    const totalTransactions = get<any>("SELECT count(*) as count FROM transactions")?.count || 0;
-    const pendingTransactions = get<any>("SELECT count(*) as count FROM transactions WHERE status = 'Pending'")?.count || 0;
-    const totalAuditLogs = get<any>("SELECT count(*) as count FROM audit_logs")?.count || 0;
+    const [totalUsers, totalAccounts, deposits, totalTransactions, pendingTransactions, totalAuditLogs] = await Promise.all([
+      User.countDocuments({ role: /^user$/i }), Account.countDocuments(),
+      Account.aggregate([{ $match: { account_type: { $ne: 'Credit Card' } } }, { $group: { _id: null, sum: { $sum: '$balance' } } }]),
+      Transaction.countDocuments(), Transaction.countDocuments({ status: /^pending$/i }), AuditLog.countDocuments(),
+    ]);
 
     res.json({
       overview: {
         totalUsers,
         totalAccounts,
-        totalDepositsUSD: totalDeposits,
+        totalDepositsUSD: deposits[0]?.sum || 0,
         totalTransactions,
         pendingTransactions,
         totalAuditLogs,
         systemStatus: 'Operational',
-        databaseEngine: 'SQLite (Embedded Server-Side)',
+        databaseEngine: 'MongoDB Atlas',
       },
     });
   } catch (err: any) {
     console.error('Error fetching admin overview:', err);
-    res.status(500).json({ error: 'Failed to fetch admin overview.' });
+    res.status(500).json({ error: errorMessage(err, 'Failed to fetch admin overview.') });
   }
 });
 
 // GET /api/admin/users
-router.get('/users', (req: AuthenticatedRequest, res: Response): void => {
+router.get('/users', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { search } = req.query;
 
-    let usersQuery = 'SELECT id, email, full_name, role, phone, created_at FROM users';
-    const params: any[] = [];
-
+    let filter: Record<string, any> = {};
     if (search && typeof search === 'string' && search.trim()) {
-      const term = `%${search.trim().toLowerCase()}%`;
-      usersQuery += ` WHERE (LOWER(email) LIKE ? OR LOWER(full_name) LIKE ? OR id IN (
-        SELECT user_id FROM accounts WHERE account_number LIKE ?
-      ))`;
-      params.push(term, term, `%${search.trim()}%`);
+      const term = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const [matchingAccounts, matchingUsers] = await Promise.all([
+        Account.find({ account_number: new RegExp(term, 'i') }).select('user_id').lean<any[]>(),
+        User.find({ $or: [{ email: new RegExp(term, 'i') }, { full_name: new RegExp(term, 'i') }] }).select('id').lean<any[]>(),
+      ]);
+      filter = { id: { $in: [...new Set([...matchingAccounts.map((a) => a.user_id), ...matchingUsers.map((u) => u.id)])] } };
     }
 
-    usersQuery += ' ORDER BY created_at DESC';
-    const users = query<any>(usersQuery, params);
-
-    // Fetch accounts for each user
+    const users = await User.find(filter).select('id email full_name role phone created_at').sort({ created_at: -1 }).lean<any[]>();
+    const allAccounts = await Account.find({ user_id: { $in: users.map((u) => u.id) } }).sort({ account_type: 1 }).lean<any[]>();
+    const accountsByUser = new Map<string, any[]>();
+    for (const account of allAccounts) accountsByUser.set(account.user_id, [...(accountsByUser.get(account.user_id) || []), account]);
     const usersWithAccounts = users.map((u) => {
-      const accounts = query<any>('SELECT * FROM accounts WHERE user_id = ? ORDER BY account_type ASC', [u.id]);
+      const accounts = accountsByUser.get(u.id) || [];
       const totalBalanceUSD = accounts
         .filter((a) => a.account_type !== 'Credit Card')
         .reduce((sum, a) => sum + a.balance, 0);
@@ -112,37 +110,33 @@ router.get('/users', (req: AuthenticatedRequest, res: Response): void => {
     res.json({ users: usersWithAccounts });
   } catch (err: any) {
     console.error('Error fetching users for admin:', err);
-    res.status(500).json({ error: 'Failed to retrieve users.' });
+    res.status(500).json({ error: errorMessage(err, 'Failed to retrieve users.') });
   }
 });
 
 // GET /api/admin/accounts
-router.get('/accounts', (req: AuthenticatedRequest, res: Response): void => {
+router.get('/accounts', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { search } = req.query;
-    let sql = `
-      SELECT a.*, u.full_name as owner_name, u.email as owner_email
-      FROM accounts a
-      JOIN users u ON a.user_id = u.id
-    `;
-    const params: any[] = [];
-
+    let accountFilter: Record<string, any> = {};
     if (search && typeof search === 'string' && search.trim()) {
-      const term = `%${search.trim().toLowerCase()}%`;
-      sql += ' WHERE (LOWER(a.account_number) LIKE ? OR LOWER(u.email) LIKE ? OR LOWER(u.full_name) LIKE ?)';
-      params.push(term, term, term);
+      const term = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const matchingUsers = await User.find({ $or: [{ email: new RegExp(term, 'i') }, { full_name: new RegExp(term, 'i') }] }).select('id').lean<any[]>();
+      accountFilter = { $or: [{ account_number: new RegExp(term, 'i') }, { user_id: { $in: matchingUsers.map((u) => u.id) } }] };
     }
 
-    sql += ' ORDER BY a.created_at DESC';
-    const accounts = query<any>(sql, params);
+    const rows = await Account.find(accountFilter).sort({ created_at: -1 }).lean<any[]>();
+    const owners = await User.find({ id: { $in: rows.map((a) => a.user_id) } }).select('id full_name email').lean<any[]>();
+    const ownersById = new Map(owners.map((owner) => [owner.id, owner]));
+    const accounts = rows.map((account) => ({ ...account, owner_name: ownersById.get(account.user_id)?.full_name, owner_email: ownersById.get(account.user_id)?.email }));
     res.json({ accounts });
   } catch (err: any) {
-    res.status(500).json({ error: 'Failed to retrieve accounts.' });
+    res.status(500).json({ error: errorMessage(err, 'Failed to retrieve accounts.') });
   }
 });
 
 // POST /api/admin/balance-adjustment
-router.post('/balance-adjustment', (req: AuthenticatedRequest, res: Response): void => {
+router.post('/balance-adjustment', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { accountId, action, amount, reason } = req.body;
 
@@ -162,74 +156,50 @@ router.post('/balance-adjustment', (req: AuthenticatedRequest, res: Response): v
       return;
     }
 
-    const account = get<any>('SELECT * FROM accounts WHERE id = ?', [accountId]);
+    const account = await Account.findOne({ id: accountId }).lean<any>();
     if (!account) {
       res.status(404).json({ error: 'Target account not found.' });
       return;
     }
 
-    const targetUser = get<any>('SELECT * FROM users WHERE id = ?', [account.user_id]);
+    const targetUser = await User.findOne({ id: account.user_id }).lean<any>();
 
-    let newBalance = account.balance;
-    let adjustmentAmount = parsedAmount;
-
-    if (action === 'credit') {
-      newBalance += parsedAmount;
-    } else {
-      if (account.balance < parsedAmount) {
-        res.status(400).json({
-          error: `Debit amount ($${parsedAmount.toFixed(2)}) exceeds current account balance ($${account.balance.toFixed(2)}).`,
-        });
-        return;
-      }
-      newBalance -= parsedAmount;
-      adjustmentAmount = -parsedAmount;
+    const adjustmentAmount = action === 'credit' ? parsedAmount : -parsedAmount;
+    const updatedAccount = await Account.findOneAndUpdate(
+      { id: accountId, ...(action === 'debit' ? { balance: { $gte: parsedAmount } } : {}) },
+      { $inc: { balance: adjustmentAmount } },
+      { new: true }
+    ).lean<any>();
+    if (!updatedAccount) {
+      res.status(400).json({
+        error: `Debit amount ($${parsedAmount.toFixed(2)}) exceeds current account balance ($${account.balance.toFixed(2)}).`,
+      });
+      return;
     }
-
-    // Update account balance
-    run('UPDATE accounts SET balance = ? WHERE id = ?', [newBalance, accountId]);
+    const newBalance = updatedAccount.balance;
 
     // Record adjustment transaction
     const txId = 'tx_adj_' + Date.now();
     const today = new Date().toISOString().split('T')[0];
     const desc = `Bank Admin ${action === 'credit' ? 'Credit' : 'Debit'}: ${reason.trim()}`;
 
-    run(
-      `INSERT INTO transactions (id, user_id, account_id, type, amount, currency, description, recipient_name, recipient_account, status, category, date, created_at)
-       VALUES (?, ?, ?, 'admin_adjustment', ?, 'USD', ?, 'Bank Administrator', ?, 'Completed', 'Adjustment', ?, ?)`,
-      [
-        txId,
-        account.user_id,
-        accountId,
-        adjustmentAmount,
-        desc,
-        `...${account.account_number.slice(-4)}`,
-        today,
-        Date.now(),
-      ]
-    );
+    await Transaction.create({
+      id: txId, user_id: account.user_id, account_id: accountId, type: 'admin_adjustment',
+      amount: adjustmentAmount, currency: 'USD', description: desc,
+      recipient_name: 'Bank Administrator', recipient_account: `...${account.account_number.slice(-4)}`,
+      status: 'Completed', category: 'Adjustment', date: today, created_at: Date.now(),
+    });
 
     // Record Audit Log
     const logId = 'log_' + Date.now();
     const auditAction = action === 'credit' ? 'BALANCE_CREDIT' : 'BALANCE_DEBIT';
     const details = `Directly ${action}ed $${parsedAmount.toFixed(2)} USD to account ${account.account_number} (${account.nickname}) owned by ${targetUser ? targetUser.email : 'Unknown'}. Reason: "${reason}"`;
 
-    run(
-      `INSERT INTO audit_logs (id, admin_id, admin_email, action, target_user_id, target_account_id, amount, details, ip_address, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        logId,
-        req.user!.id,
-        req.user!.email,
-        auditAction,
-        account.user_id,
-        accountId,
-        parsedAmount,
-        details,
-        req.ip || '127.0.0.1',
-        new Date().toISOString(),
-      ]
-    );
+    await AuditLog.create({
+      id: logId, admin_id: req.user!.id, admin_email: req.user!.email,
+      action: auditAction, target_user_id: account.user_id, target_account_id: accountId,
+      amount: parsedAmount, details, ip_address: req.ip || '127.0.0.1', created_at: new Date().toISOString(),
+    });
 
     res.json({
       success: true,
@@ -241,13 +211,13 @@ router.post('/balance-adjustment', (req: AuthenticatedRequest, res: Response): v
     });
   } catch (err: any) {
     console.error('Error in balance adjustment:', err);
-    res.status(500).json({ error: 'Failed to process balance adjustment.' });
+    res.status(500).json({ error: errorMessage(err, 'Failed to process balance adjustment.') });
   }
 });
 
 // POST /api/admin/credit-user
 // Admin endpoint to instantly credit customer accounts
-router.post('/credit-user', (req: AuthenticatedRequest, res: Response): void => {
+router.post('/credit-user', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { userId, accountId, accountNumber, amount, memo, description, reason } = req.body || {};
     const memoText = String(memo || description || reason || 'Administrative Credit / Fund Injection').trim();
@@ -260,19 +230,13 @@ router.post('/credit-user', (req: AuthenticatedRequest, res: Response): void => 
 
     let account: any = null;
     if (accountId) {
-      account = get<any>('SELECT * FROM accounts WHERE id = ?', [accountId]);
+      account = await Account.findOne({ id: accountId }).lean<any>();
     } else if (accountNumber) {
-      account = get<any>('SELECT * FROM accounts WHERE account_number = ?', [String(accountNumber).trim()]);
+      account = await Account.findOne({ account_number: String(accountNumber).trim() }).lean<any>();
     } else if (userId) {
-      account = get<any>(
-        `SELECT * FROM accounts WHERE user_id = ? ORDER BY 
-          CASE account_type 
-            WHEN 'Checking' THEN 1 
-            WHEN 'Savings' THEN 2 
-            ELSE 3 
-          END ASC LIMIT 1`,
-        [userId]
-      );
+      const accounts = await Account.find({ user_id: userId }).sort({ created_at: 1 }).lean<any[]>();
+      accounts.sort((a, b) => ({ Checking: 1, Savings: 2 }[a.account_type as 'Checking' | 'Savings'] || 3) - ({ Checking: 1, Savings: 2 }[b.account_type as 'Checking' | 'Savings'] || 3));
+      account = accounts[0] || null;
     }
 
     if (!account) {
@@ -280,128 +244,130 @@ router.post('/credit-user', (req: AuthenticatedRequest, res: Response): void => 
       return;
     }
 
-    const targetUser = get<any>('SELECT id, email, full_name FROM users WHERE id = ?', [account.user_id]);
+    const targetUser = await User.findOne({ id: account.user_id }).select('id email full_name').lean<any>();
 
     // Increment balance directly
-    const newBalance = account.balance + parsedAmount;
-    run('UPDATE accounts SET balance = ? WHERE id = ?', [newBalance, account.id]);
+    const updatedAccount = await Account.findOneAndUpdate(
+      { id: account.id }, { $inc: { balance: parsedAmount } }, { new: true }
+    ).lean<any>();
+    if (!updatedAccount) {
+      res.status(404).json({ error: 'Target customer account could not be found.' });
+      return;
+    }
+    const newBalance = updatedAccount.balance;
 
     // Record as APPROVED transaction
     const txId = 'tx_cred_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
     const today = new Date().toISOString().split('T')[0];
     const fullDesc = 'ACH Deposit Confirmed';
 
-    run(
-      `INSERT INTO transactions (id, user_id, account_id, type, amount, currency, description, recipient_name, recipient_account, status, category, date, created_at)
-       VALUES (?, ?, ?, 'admin_credit', ?, 'USD', ?, 'Bank Administrator', ?, 'APPROVED', 'Deposit', ?, ?)`,
-      [
-        txId,
-        account.user_id,
-        account.id,
-        parsedAmount,
-        fullDesc,
-        account.account_number,
-        today,
-        Date.now(),
-      ]
-    );
+    await Transaction.create({
+      id: txId, user_id: account.user_id, account_id: account.id, type: 'admin_credit',
+      amount: parsedAmount, currency: 'USD', description: fullDesc,
+      recipient_name: 'Bank Administrator', recipient_account: account.account_number,
+      status: 'APPROVED', category: 'Deposit', date: today, created_at: Date.now(),
+    });
 
     // Record audit log
     const logId = 'aud_cred_' + Date.now();
-    run(
-      `INSERT INTO audit_logs (id, admin_id, admin_email, action, target_user_id, target_account_id, amount, details, ip_address, created_at)
-       VALUES (?, ?, ?, 'ADMIN_CREDIT', ?, ?, ?, ?, ?, ?)`,
-      [
-        logId,
-        req.user!.id,
-        req.user!.email,
-        account.user_id,
-        account.id,
-        parsedAmount,
-        `Admin fund injection of $${parsedAmount.toFixed(2)} to ${targetUser?.full_name || 'customer'} (Acct: ${account.account_number}). Memo: ${memoText}`,
-        req.ip || '127.0.0.1',
-        new Date().toISOString(),
-      ]
-    );
+    await AuditLog.create({
+      id: logId, admin_id: req.user!.id, admin_email: req.user!.email,
+      action: 'ADMIN_CREDIT', target_user_id: account.user_id, target_account_id: account.id,
+      amount: parsedAmount,
+      details: `Admin fund injection of $${parsedAmount.toFixed(2)} to ${targetUser?.full_name || 'customer'} (Acct: ${account.account_number}). Memo: ${memoText}`,
+      ip_address: req.ip || '127.0.0.1', created_at: new Date().toISOString(),
+    });
 
     res.json({
       success: true,
       message: `Successfully credited $${parsedAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })} to ${targetUser?.full_name || 'Customer'}'s account (${account.account_number}).`,
       newBalance,
       creditedAmount: parsedAmount,
-      account: { ...account, balance: newBalance },
+      account: updatedAccount,
       user: targetUser,
       transactionId: txId,
     });
   } catch (err: any) {
     console.error('Error in credit-user:', err);
-    res.status(500).json({ error: 'Failed to process admin credit to customer account.' });
+    res.status(500).json({ error: errorMessage(err, 'Failed to process admin credit to customer account.') });
   }
 });
 
 // GET /api/admin/audit-logs
-router.get('/audit-logs', (req: AuthenticatedRequest, res: Response): void => {
+router.get('/audit-logs', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { limit = 100 } = req.query;
-    const logs = query<any>(
-      `SELECT al.*, u.full_name as target_user_name, a.account_number as target_account_number
-       FROM audit_logs al
-       LEFT JOIN users u ON al.target_user_id = u.id
-       LEFT JOIN accounts a ON al.target_account_id = a.id
-       ORDER BY al.created_at DESC LIMIT ?`,
-      [Number(limit)]
-    );
+    const rows = await AuditLog.find().sort({ created_at: -1 }).limit(Math.min(Number(limit) || 100, 500)).lean<any[]>();
+    const [users, accounts] = await Promise.all([
+      User.find({ id: { $in: rows.map((row) => row.target_user_id).filter(Boolean) } }).select('id full_name').lean<any[]>(),
+      Account.find({ id: { $in: rows.map((row) => row.target_account_id).filter(Boolean) } }).select('id account_number').lean<any[]>(),
+    ]);
+    const usersById = new Map(users.map((user) => [user.id, user]));
+    const accountsById = new Map(accounts.map((account) => [account.id, account]));
+    const logs = rows.map((row) => ({
+      ...row,
+      target_user_name: usersById.get(row.target_user_id)?.full_name,
+      target_account_number: accountsById.get(row.target_account_id)?.account_number,
+    }));
     res.json({ logs });
   } catch (err: any) {
     console.error('Error fetching audit logs:', err);
-    res.status(500).json({ error: 'Failed to retrieve audit logs.' });
+    res.status(500).json({ error: errorMessage(err, 'Failed to retrieve audit logs.') });
   }
 });
 
 // GET /api/admin/transactions
-router.get('/transactions', (req: AuthenticatedRequest, res: Response): void => {
+router.get('/transactions', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { limit = 100 } = req.query;
-    const transactions = query<any>(
-      `SELECT t.*, u.email as user_email, u.full_name as user_name, a.account_number, a.nickname as account_name
-       FROM transactions t
-       JOIN users u ON t.user_id = u.id
-       JOIN accounts a ON t.account_id = a.id
-       ORDER BY t.date DESC, t.created_at DESC LIMIT ?`,
-      [Number(limit)]
-    );
+    const rows = await Transaction.find().sort({ date: -1, created_at: -1 }).limit(Math.min(Number(limit) || 100, 500)).lean<any[]>();
+    const [users, accounts] = await Promise.all([
+      User.find({ id: { $in: rows.map((row) => row.user_id) } }).select('id email full_name').lean<any[]>(),
+      Account.find({ id: { $in: rows.map((row) => row.account_id) } }).select('id account_number nickname').lean<any[]>(),
+    ]);
+    const usersById = new Map(users.map((user) => [user.id, user]));
+    const accountsById = new Map(accounts.map((account) => [account.id, account]));
+    const transactions = rows.map((row) => ({
+      ...row,
+      user_email: usersById.get(row.user_id)?.email,
+      user_name: usersById.get(row.user_id)?.full_name,
+      account_number: accountsById.get(row.account_id)?.account_number,
+      account_name: accountsById.get(row.account_id)?.nickname,
+    }));
     res.json({ transactions });
   } catch (err: any) {
-    res.status(500).json({ error: 'Failed to retrieve system transactions.' });
+    res.status(500).json({ error: errorMessage(err, 'Failed to retrieve system transactions.') });
   }
 });
 
 // GET /api/admin/pending-deposits
 // Fetch all PENDING deposit transactions with customer details
-router.get('/pending-deposits', (req: AuthenticatedRequest, res: Response): void => {
+router.get('/pending-deposits', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const rows = query<any>(
-      `SELECT transactions.*, users.email as user_email, users.full_name as user_name,
-              accounts.account_number, accounts.nickname as account_name
-       FROM transactions
-       LEFT JOIN users ON users.id = transactions.user_id
-       LEFT JOIN accounts ON accounts.id = transactions.account_id
-       WHERE UPPER(transactions.status) = 'PENDING'
-       ORDER BY transactions.date DESC`,
-      []
-    );
-    console.log('--> Pending Fetch Executed. Found rows:', rows);
-    console.log('API sending pending deposits:', rows.length);
-    res.status(200).json({ success: true, pendingDeposits: rows || [] });
+    const rows = await Transaction.find({ status: /^pending$/i }).sort({ date: -1 }).lean<any[]>();
+    const [users, accounts] = await Promise.all([
+      User.find({ id: { $in: rows.map((row) => row.user_id) } }).select('id email full_name').lean<any[]>(),
+      Account.find({ id: { $in: rows.map((row) => row.account_id) } }).select('id account_number nickname').lean<any[]>(),
+    ]);
+    const usersById = new Map(users.map((user) => [user.id, user]));
+    const accountsById = new Map(accounts.map((account) => [account.id, account]));
+    const pending = rows.map((row) => ({
+      ...row,
+      user_email: usersById.get(row.user_id)?.email,
+      user_name: usersById.get(row.user_id)?.full_name,
+      account_number: accountsById.get(row.account_id)?.account_number,
+      account_name: accountsById.get(row.account_id)?.nickname,
+    }));
+    res.status(200).json({ success: true, pendingDeposits: pending });
   } catch (err: any) {
     console.error('Error fetching pending deposits:', err);
-    res.status(500).json({ error: 'Failed to retrieve pending deposits.' });
+    res.status(500).json({ error: errorMessage(err, 'Failed to retrieve pending deposits.') });
   }
 });
 
 // POST /api/admin/approve-deposit
 // Approves a PENDING deposit transaction and credits the account
-router.post('/approve-deposit', (req: AuthenticatedRequest, res: Response): void => {
+router.post('/approve-deposit', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { transactionId } = req.body;
 
@@ -411,7 +377,7 @@ router.post('/approve-deposit', (req: AuthenticatedRequest, res: Response): void
     }
 
     // Retrieve transaction details
-    const trans = get<any>('SELECT * FROM transactions WHERE id = ?', [transactionId]);
+    const trans = await Transaction.findOne({ id: transactionId }).lean<any>();
     if (!trans) {
       res.status(404).json({ error: 'Transaction not found.' });
       return;
@@ -428,37 +394,41 @@ router.post('/approve-deposit', (req: AuthenticatedRequest, res: Response): void
     }
 
     // Retrieve account to update balance
-    const account = get<any>('SELECT * FROM accounts WHERE id = ?', [trans.account_id]);
+    const account = await Account.findOne({ id: trans.account_id }).lean<any>();
     if (!account) {
       res.status(404).json({ error: 'Associated account not found.' });
       return;
     }
 
     // Balances are stored on accounts in this schema. Increment the associated account atomically.
-    run('UPDATE accounts SET balance = balance + ? WHERE id = ?', [trans.amount, trans.account_id]);
-    const updatedAccount = get<any>('SELECT * FROM accounts WHERE id = ?', [trans.account_id]);
-    const newBalance = updatedAccount?.balance ?? account.balance + trans.amount;
-
-    // Mark transaction as APPROVED
-    run('UPDATE transactions SET status = ? WHERE id = ?', ['APPROVED', transactionId]);
+    const approved = await Transaction.findOneAndUpdate(
+      { id: transactionId, status: 'PENDING' },
+      { $set: { status: 'APPROVED' } },
+      { new: true }
+    ).lean<any>();
+    if (!approved) {
+      res.status(409).json({ error: 'Transaction is already being processed or is no longer pending.' });
+      return;
+    }
+    const updatedAccount = await Account.findOneAndUpdate(
+      { id: trans.account_id }, { $inc: { balance: trans.amount } }, { new: true }
+    ).lean<any>();
+    if (!updatedAccount) {
+      await Transaction.updateOne({ id: transactionId, status: 'APPROVED' }, { $set: { status: 'PENDING' } });
+      res.status(404).json({ error: 'Associated account not found.' });
+      return;
+    }
+    const newBalance = updatedAccount.balance;
 
     // Record audit log
     const logId = 'aud_app_' + Date.now();
-    run(
-      `INSERT INTO audit_logs (id, admin_id, admin_email, action, target_user_id, target_account_id, amount, details, ip_address, created_at)
-       VALUES (?, ?, ?, 'APPROVE_DEPOSIT', ?, ?, ?, ?, ?, ?)`,
-      [
-        logId,
-        req.user!.id,
-        req.user!.email,
-        trans.user_id,
-        trans.account_id,
-        trans.amount,
-        `Approved pending deposit of $${trans.amount.toFixed(2)} to account ${account.account_number}. Transaction: ${trans.description}`,
-        req.ip || '127.0.0.1',
-        new Date().toISOString(),
-      ]
-    );
+    await AuditLog.create({
+      id: logId, admin_id: req.user!.id, admin_email: req.user!.email,
+      action: 'APPROVE_DEPOSIT', target_user_id: trans.user_id,
+      target_account_id: trans.account_id, amount: trans.amount,
+      details: `Approved pending deposit of $${trans.amount.toFixed(2)} to account ${account.account_number}. Transaction: ${trans.description}`,
+      ip_address: req.ip || '127.0.0.1', created_at: new Date().toISOString(),
+    });
 
     res.status(200).json({
       success: true,
@@ -479,7 +449,7 @@ router.post('/approve-deposit', (req: AuthenticatedRequest, res: Response): void
     });
   } catch (err: any) {
     console.error('Error approving deposit:', err);
-    res.status(500).json({ error: err.message || 'Failed to approve deposit.' });
+    res.status(500).json({ error: errorMessage(err, 'Failed to approve deposit.') });
   }
 });
 

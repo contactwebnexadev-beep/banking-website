@@ -1,23 +1,18 @@
 import { Router, Response } from 'express';
-import { query, get, run } from '../db.js';
+import { User, Account, Transaction, AuditLog } from '../models.js';
+import { errorMessage, requireDatabase } from '../db.js';
 import { requireAuth, AuthenticatedRequest } from '../auth.js';
 
 const router = Router();
+router.use(requireDatabase);
 
 // GET /api/user/accounts
-router.get('/accounts', requireAuth, (req: AuthenticatedRequest, res: Response): void => {
+router.get('/accounts', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
-    const accounts = query<any>(
-      `SELECT * FROM accounts WHERE user_id = ? ORDER BY 
-        CASE account_type 
-          WHEN 'Checking' THEN 1 
-          WHEN 'Savings' THEN 2 
-          WHEN 'Credit Card' THEN 3 
-          ELSE 4 
-        END, created_at ASC`,
-      [userId]
-    );
+    const accounts = await Account.find({ user_id: userId }).sort({ created_at: 1 }).lean<any[]>();
+    const rank: Record<string, number> = { Checking: 1, Savings: 2, 'Credit Card': 3 };
+    accounts.sort((a, b) => (rank[a.account_type] || 4) - (rank[b.account_type] || 4));
 
     // Format account numbers (e.g. "...4821") and balances
     const formattedAccounts = accounts.map((acc) => {
@@ -33,56 +28,51 @@ router.get('/accounts', requireAuth, (req: AuthenticatedRequest, res: Response):
     res.json({ accounts: formattedAccounts });
   } catch (err: any) {
     console.error('Error fetching accounts:', err);
-    res.status(500).json({ error: 'Failed to retrieve accounts.' });
+    res.status(500).json({ error: errorMessage(err, 'Failed to retrieve accounts.') });
   }
 });
 
 // GET /api/user/transactions
-router.get('/transactions', requireAuth, (req: AuthenticatedRequest, res: Response): void => {
+router.get('/transactions', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
     const { accountId, search, status, limit = 50 } = req.query;
 
-    let sql = `
-      SELECT t.*, a.nickname as account_name, a.account_number
-      FROM transactions t
-      JOIN accounts a ON t.account_id = a.id
-      WHERE t.user_id = ?
-    `;
-    const params: any[] = [userId];
-
+    const filter: Record<string, any> = { user_id: userId };
     if (accountId && accountId !== 'all') {
-      sql += ' AND t.account_id = ?';
-      params.push(accountId);
+      filter.account_id = accountId;
     }
 
     if (status && status !== 'all') {
-      sql += ' AND LOWER(t.status) = LOWER(?)';
-      params.push(status);
+      filter.status = new RegExp(`^${String(status).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i');
     }
 
     if (search && typeof search === 'string' && search.trim() !== '') {
-      sql += ' AND (LOWER(t.description) LIKE ? OR LOWER(t.recipient_name) LIKE ?)';
-      const term = `%${search.trim().toLowerCase()}%`;
-      params.push(term, term);
+      const term = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      filter.$or = [{ description: new RegExp(term, 'i') }, { recipient_name: new RegExp(term, 'i') }];
     }
 
-    sql += ' ORDER BY t.date DESC, t.created_at DESC LIMIT ?';
-    params.push(Number(limit));
-
-    const transactions = query<any>(sql, params);
+    const rows = await Transaction.find(filter).sort({ date: -1, created_at: -1 }).limit(Math.min(Number(limit) || 50, 500)).lean<any[]>();
+    const accountIds = [...new Set(rows.map((row) => row.account_id))];
+    const accounts = await Account.find({ id: { $in: accountIds } }).select('id nickname account_number').lean<any[]>();
+    const accountsById = new Map(accounts.map((account) => [account.id, account]));
+    const transactions = rows.map((row) => ({
+      ...row,
+      account_name: accountsById.get(row.account_id)?.nickname,
+      account_number: accountsById.get(row.account_id)?.account_number,
+    }));
     res.json({ transactions });
   } catch (err: any) {
     console.error('Error fetching transactions:', err);
-    res.status(500).json({ error: 'Failed to retrieve transactions.' });
+    res.status(500).json({ error: errorMessage(err, 'Failed to retrieve transactions.') });
   }
 });
 
 // GET /api/user/summary
-router.get('/summary', requireAuth, (req: AuthenticatedRequest, res: Response): void => {
+router.get('/summary', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
-    const accounts = query<any>('SELECT * FROM accounts WHERE user_id = ?', [userId]);
+    const accounts = await Account.find({ user_id: userId }).lean<any[]>();
 
     let totalCheckingSavings = 0;
     let totalCreditUsed = 0;
@@ -97,39 +87,31 @@ router.get('/summary', requireAuth, (req: AuthenticatedRequest, res: Response): 
       }
     });
 
-    const pendingCountRow = get<any>(
-      "SELECT count(*) as count FROM transactions WHERE user_id = ? AND status = 'Pending'",
-      [userId]
-    );
+    const pendingTransactionsCount = await Transaction.countDocuments({ user_id: userId, status: /^pending$/i });
 
     res.json({
       totalDepositBalanceUSD: totalCheckingSavings,
       totalCreditBalanceUSD: totalCreditUsed,
       totalCreditLimitUSD: totalCreditLimit,
-      pendingTransactionsCount: pendingCountRow ? pendingCountRow.count : 0,
+      pendingTransactionsCount,
       accountsCount: accounts.length,
     });
   } catch (err: any) {
     console.error('Error fetching user summary:', err);
-    res.status(500).json({ error: 'Failed to retrieve summary.' });
+    res.status(500).json({ error: errorMessage(err, 'Failed to retrieve summary.') });
   }
 });
 
 // GET /api/user/profile
-router.get('/profile', requireAuth, (req: AuthenticatedRequest, res: Response): void => {
+router.get('/profile', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const user = get<any>('SELECT id, email, full_name, role, phone, security_pin, created_at FROM users WHERE id = ?', [
-      req.user!.id,
-    ]);
+    const user = await User.findOne({ id: req.user!.id }).select('id email full_name role phone created_at').lean<any>();
     if (!user) {
       res.status(404).json({ error: 'User not found' });
       return;
     }
 
-    const accounts = query<any>(
-      'SELECT * FROM accounts WHERE user_id = ? ORDER BY created_at ASC',
-      [req.user!.id]
-    );
+    const accounts = await Account.find({ user_id: req.user!.id }).sort({ created_at: 1 }).lean<any[]>();
     const primaryAccount = accounts.length > 0 ? accounts[0] : null;
 
     res.json({
@@ -139,7 +121,7 @@ router.get('/profile', requireAuth, (req: AuthenticatedRequest, res: Response): 
         full_name: user.full_name,
         role: user.role,
         phone: user.phone,
-        security_pin: user.security_pin || '••••',
+        security_pin: '••••',
         created_at: user.created_at,
         account_number: primaryAccount ? primaryAccount.account_number : '4800000000',
         routing_number: primaryAccount ? primaryAccount.routing_number : '026009593',
@@ -154,12 +136,12 @@ router.get('/profile', requireAuth, (req: AuthenticatedRequest, res: Response): 
     });
   } catch (err: any) {
     console.error('Failed to fetch profile:', err);
-    res.status(500).json({ error: 'Failed to fetch user profile' });
+    res.status(500).json({ error: errorMessage(err, 'Failed to fetch user profile.') });
   }
 });
 
 // POST /api/user/deposit or /api/user/accounts/deposit
-router.post(['/deposit', '/accounts/deposit'], requireAuth, (req: AuthenticatedRequest, res: Response): void => {
+router.post(['/deposit', '/accounts/deposit'], requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
     const { institutionName, accountNumber, routingNumber, amount, targetAccountId } = req.body || {};
@@ -191,19 +173,13 @@ router.post(['/deposit', '/accounts/deposit'], requireAuth, (req: AuthenticatedR
 
     let targetAccount: any = null;
     if (targetAccountId) {
-      targetAccount = get<any>('SELECT * FROM accounts WHERE id = ? AND user_id = ?', [targetAccountId, userId]);
+      targetAccount = await Account.findOne({ id: targetAccountId, user_id: userId }).lean<any>();
     }
 
     if (!targetAccount) {
-      targetAccount = get<any>(
-        `SELECT * FROM accounts WHERE user_id = ? ORDER BY 
-          CASE account_type 
-            WHEN 'Checking' THEN 1 
-            WHEN 'Savings' THEN 2 
-            ELSE 3 
-          END ASC LIMIT 1`,
-        [userId]
-      );
+      const accounts = await Account.find({ user_id: userId }).sort({ created_at: 1 }).lean<any[]>();
+      accounts.sort((a, b) => ({ Checking: 1, Savings: 2 }[a.account_type as 'Checking' | 'Savings'] || 3) - ({ Checking: 1, Savings: 2 }[b.account_type as 'Checking' | 'Savings'] || 3));
+      targetAccount = accounts[0] || null;
     }
 
     if (!targetAccount) {
@@ -211,52 +187,40 @@ router.post(['/deposit', '/accounts/deposit'], requireAuth, (req: AuthenticatedR
       return;
     }
 
-    const newBalance = targetAccount.balance + parsedAmount;
-    run('UPDATE accounts SET balance = ? WHERE id = ?', [newBalance, targetAccount.id]);
+    const updatedAccount = await Account.findOneAndUpdate(
+      { id: targetAccount.id, user_id: userId },
+      { $inc: { balance: parsedAmount } },
+      { new: true }
+    ).lean<any>();
+    const newBalance = updatedAccount.balance;
 
     const txId = 'tx_dep_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
     const today = new Date().toISOString().split('T')[0];
     const extLast4 = cleanAccountNum.slice(-4) || 'XXXX';
     const txDescription = `External ACH Deposit: ${cleanInstitution} (Acct ...${extLast4})`;
 
-    run(
-      `INSERT INTO transactions (id, user_id, account_id, type, amount, currency, description, recipient_name, recipient_account, status, category, date, created_at)
-       VALUES (?, ?, ?, 'deposit', ?, 'USD', ?, ?, ?, 'Completed', 'Deposit', ?, ?)`,
-      [
-        txId,
-        userId,
-        targetAccount.id,
-        parsedAmount,
-        txDescription,
-        cleanInstitution,
-        `External ...${extLast4}`,
-        today,
-        Date.now(),
-      ]
-    );
+    await Transaction.create({
+      id: txId, user_id: userId, account_id: targetAccount.id,
+      type: 'deposit', amount: parsedAmount, currency: 'USD', description: txDescription,
+      recipient_name: cleanInstitution, recipient_account: `External ...${extLast4}`,
+      status: 'Completed', category: 'Deposit', date: today, created_at: Date.now(),
+    });
 
     const logId = 'aud_dep_' + Date.now();
-    run(
-      `INSERT INTO audit_logs (id, admin_id, admin_email, action, target_user_id, target_account_id, amount, details, ip_address, created_at)
-       VALUES (?, 'customer', ?, 'EXTERNAL_DEPOSIT', ?, ?, ?, ?, ?, ?)`,
-      [
-        logId,
-        req.user!.email,
-        userId,
-        targetAccount.id,
-        parsedAmount,
-        `External ACH Transfer of $${parsedAmount.toFixed(2)} from ${cleanInstitution} (Routing: ${cleanRoutingNum}, Acct: ...${extLast4}) into account ${targetAccount.account_number}`,
-        req.ip || '127.0.0.1',
-        new Date().toISOString(),
-      ]
-    );
+    await AuditLog.create({
+      id: logId, admin_id: 'customer', admin_email: req.user!.email,
+      action: 'EXTERNAL_DEPOSIT', target_user_id: userId, target_account_id: targetAccount.id,
+      amount: parsedAmount,
+      details: `External ACH Transfer of $${parsedAmount.toFixed(2)} from ${cleanInstitution} (Routing: ${cleanRoutingNum}, Acct: ...${extLast4}) into account ${targetAccount.account_number}`,
+      ip_address: req.ip || '127.0.0.1', created_at: new Date().toISOString(),
+    });
 
     res.status(200).json({
       success: true,
       message: `Deposit of $${parsedAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })} from ${cleanInstitution} successfully credited to your ${targetAccount.nickname}.`,
       newBalance,
       depositedAmount: parsedAmount,
-      account: { ...targetAccount, balance: newBalance },
+      account: { ...updatedAccount, balance: newBalance },
       transaction: {
         id: txId,
         account_id: targetAccount.id,
@@ -275,7 +239,7 @@ router.post(['/deposit', '/accounts/deposit'], requireAuth, (req: AuthenticatedR
     });
   } catch (err: any) {
     console.error('Error processing external deposit:', err);
-    res.status(500).json({ error: 'An error occurred while processing the external deposit.' });
+    res.status(500).json({ error: errorMessage(err, 'An error occurred while processing the external deposit.') });
   }
 });
 

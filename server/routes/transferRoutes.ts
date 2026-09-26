@@ -1,11 +1,13 @@
 import { Router, Response } from 'express';
-import { query, get, run } from '../db.js';
+import { Account, Transaction, VerificationCode } from '../models.js';
+import { errorMessage, requireDatabase } from '../db.js';
 import { requireAuth, AuthenticatedRequest, generateOTP } from '../auth.js';
 
 const router = Router();
+router.use(requireDatabase);
 
 // POST /api/transfers/initiate
-router.post('/initiate', requireAuth, (req: AuthenticatedRequest, res: Response): void => {
+router.post('/initiate', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
     const {
@@ -27,10 +29,7 @@ router.post('/initiate', requireAuth, (req: AuthenticatedRequest, res: Response)
     }
 
     // Verify source account
-    const sourceAccount = get<any>(
-      'SELECT * FROM accounts WHERE id = ? AND user_id = ?',
-      [sourceAccountId, userId]
-    );
+    const sourceAccount = await Account.findOne({ id: sourceAccountId, user_id: userId }).lean<any>();
 
     if (!sourceAccount) {
       res.status(404).json({ error: 'Source account not found.' });
@@ -49,10 +48,7 @@ router.post('/initiate', requireAuth, (req: AuthenticatedRequest, res: Response)
     let destDisplayAccount = recipientAccount || '';
 
     if (transferType === 'internal') {
-      const destAccount = get<any>(
-        'SELECT * FROM accounts WHERE id = ? AND user_id = ?',
-        [destinationAccountId, userId]
-      );
+      const destAccount = await Account.findOne({ id: destinationAccountId, user_id: userId }).lean<any>();
       if (!destAccount) {
         res.status(400).json({ error: 'Destination account not found.' });
         return;
@@ -85,20 +81,11 @@ router.post('/initiate', requireAuth, (req: AuthenticatedRequest, res: Response)
       memo: memo || 'Online Banking Transfer',
     };
 
-    run(
-      `INSERT INTO verification_codes (id, user_id, email, phone, code, purpose, metadata, expires_at, verified, created_at)
-       VALUES (?, ?, ?, ?, ?, 'transfer', ?, ?, 0, ?)`,
-      [
-        verificationId,
-        userId,
-        req.user!.email,
-        req.user!.phone,
-        otpCode,
-        JSON.stringify(transferPayload),
-        expiresAt,
-        Date.now(),
-      ]
-    );
+    await VerificationCode.create({
+      id: verificationId, user_id: userId, email: req.user!.email, phone: req.user!.phone,
+      code: otpCode, purpose: 'transfer', metadata: transferPayload,
+      expires_at: expiresAt, verified: false, created_at: Date.now(),
+    });
 
     const maskedContact = channel === 'sms'
       ? (req.user!.phone.length >= 4 ? `(***) ***-${req.user!.phone.slice(-4)}` : req.user!.phone)
@@ -120,12 +107,12 @@ router.post('/initiate', requireAuth, (req: AuthenticatedRequest, res: Response)
     });
   } catch (err: any) {
     console.error('Error initiating transfer:', err);
-    res.status(500).json({ error: 'Transfer initiation failed.' });
+    res.status(500).json({ error: errorMessage(err, 'Transfer initiation failed.') });
   }
 });
 
 // POST /api/transfers/confirm
-router.post('/confirm', requireAuth, (req: AuthenticatedRequest, res: Response): void => {
+router.post('/confirm', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
     const { verificationId, code } = req.body;
@@ -135,18 +122,17 @@ router.post('/confirm', requireAuth, (req: AuthenticatedRequest, res: Response):
       return;
     }
 
-    const verificationRecord = get<any>(
-      `SELECT * FROM verification_codes 
-       WHERE id = ? AND user_id = ? AND purpose = 'transfer' AND verified = 0 AND expires_at > ?`,
-      [verificationId, userId, Date.now()]
-    );
+    const verificationRecord = await VerificationCode.findOne({
+      id: verificationId, user_id: userId, purpose: 'transfer',
+      verified: false, expires_at: { $gt: Date.now() },
+    }).lean<any>();
 
     if (!verificationRecord || verificationRecord.code !== code.trim()) {
       res.status(400).json({ error: 'Invalid or expired authorization code. Please verify the 6-digit code and try again.' });
       return;
     }
 
-    const payload = JSON.parse(verificationRecord.metadata || '{}');
+    const payload = verificationRecord.metadata || {};
     const {
       sourceAccountId,
       destinationAccountId,
@@ -158,10 +144,7 @@ router.post('/confirm', requireAuth, (req: AuthenticatedRequest, res: Response):
     } = payload;
 
     // Check source account balance again
-    const sourceAccount = get<any>('SELECT * FROM accounts WHERE id = ? AND user_id = ?', [
-      sourceAccountId,
-      userId,
-    ]);
+    const sourceAccount = await Account.findOne({ id: sourceAccountId, user_id: userId }).lean<any>();
 
     if (!sourceAccount) {
       res.status(404).json({ error: 'Source account not found.' });
@@ -174,59 +157,49 @@ router.post('/confirm', requireAuth, (req: AuthenticatedRequest, res: Response):
     }
 
     // Execute transfer
-    const newSourceBalance = sourceAccount.balance - amount;
-    run('UPDATE accounts SET balance = ? WHERE id = ?', [newSourceBalance, sourceAccountId]);
+    const debitedAccount = await Account.findOneAndUpdate(
+      { id: sourceAccountId, user_id: userId, balance: { $gte: amount } },
+      { $inc: { balance: -amount } },
+      { new: true }
+    ).lean<any>();
+    if (!debitedAccount) {
+      res.status(400).json({ error: 'Transfer failed: Insufficient funds in source account.' });
+      return;
+    }
+    const newSourceBalance = debitedAccount.balance;
 
     const txIdOut = 'tx_' + Date.now() + '_out';
     const today = new Date().toISOString().split('T')[0];
 
     // Create Outgoing Transaction
     const outgoingDesc = `Online Banking Transfer Out to ${recipientName}`;
-    run(
-      `INSERT INTO transactions (id, user_id, account_id, type, amount, currency, description, recipient_name, recipient_account, status, category, date, created_at)
-       VALUES (?, ?, ?, 'transfer_out', ?, 'USD', ?, ?, ?, 'Completed', 'Transfer', ?, ?)`,
-      [
-        txIdOut,
-        userId,
-        sourceAccountId,
-        amount,
-        outgoingDesc,
-        recipientName,
-        recipientAccount,
-        today,
-        Date.now(),
-      ]
-    );
+    await Transaction.create({
+      id: txIdOut, user_id: userId, account_id: sourceAccountId,
+      type: 'transfer_out', amount, currency: 'USD', description: outgoingDesc,
+      recipient_name: recipientName, recipient_account: recipientAccount,
+      status: 'Completed', category: 'Transfer', date: today, created_at: Date.now(),
+    });
 
     // If destination account is internal or registered user account:
     if (transferType === 'internal' && destinationAccountId) {
-      const destAccount = get<any>('SELECT * FROM accounts WHERE id = ?', [destinationAccountId]);
+      const destAccount = await Account.findOne({ id: destinationAccountId }).lean<any>();
       if (destAccount) {
-        const newDestBalance = destAccount.balance + amount;
-        run('UPDATE accounts SET balance = ? WHERE id = ?', [newDestBalance, destinationAccountId]);
+        await Account.updateOne({ id: destinationAccountId }, { $inc: { balance: amount } });
 
         const txIdIn = 'tx_' + Date.now() + '_in';
         const incomingDesc = `Transfer Received from ${sourceAccount.nickname}`;
-        run(
-          `INSERT INTO transactions (id, user_id, account_id, type, amount, currency, description, recipient_name, recipient_account, status, category, date, created_at)
-           VALUES (?, ?, ?, 'transfer_in', ?, 'USD', ?, ?, ?, 'Completed', 'Transfer', ?, ?)`,
-          [
-            txIdIn,
-            destAccount.user_id,
-            destinationAccountId,
-            amount,
-            incomingDesc,
-            sourceAccount.nickname,
-            `...${sourceAccount.account_number.slice(-4)}`,
-            today,
-            Date.now() + 1,
-          ]
-        );
+        await Transaction.create({
+          id: txIdIn, user_id: destAccount.user_id, account_id: destinationAccountId,
+          type: 'transfer_in', amount, currency: 'USD', description: incomingDesc,
+          recipient_name: sourceAccount.nickname,
+          recipient_account: `...${sourceAccount.account_number.slice(-4)}`,
+          status: 'Completed', category: 'Transfer', date: today, created_at: Date.now() + 1,
+        });
       }
     }
 
     // Mark verification verified
-    run('UPDATE verification_codes SET verified = 1 WHERE id = ?', [verificationId]);
+    await VerificationCode.updateOne({ id: verificationId, verified: false }, { $set: { verified: true } });
 
     res.json({
       success: true,
@@ -238,24 +211,23 @@ router.post('/confirm', requireAuth, (req: AuthenticatedRequest, res: Response):
     });
   } catch (err: any) {
     console.error('Error confirming transfer:', err);
-    res.status(500).json({ error: 'Transfer execution failed.' });
+    res.status(500).json({ error: errorMessage(err, 'Transfer execution failed.') });
   }
 });
 
 // GET /api/transfers/recent-recipients
-router.get('/recent-recipients', requireAuth, (req: AuthenticatedRequest, res: Response): void => {
+router.get('/recent-recipients', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
-    const recipients = query<any>(
-      `SELECT DISTINCT recipient_name, recipient_account 
-       FROM transactions 
-       WHERE user_id = ? AND recipient_name IS NOT NULL AND recipient_name != ''
-       LIMIT 6`,
-      [userId]
-    );
+    const recipients = await Transaction.aggregate([
+      { $match: { user_id: userId, recipient_name: { $exists: true, $nin: [null, ''] } } },
+      { $group: { _id: { recipient_name: '$recipient_name', recipient_account: '$recipient_account' } } },
+      { $limit: 6 },
+      { $project: { _id: 0, recipient_name: '$_id.recipient_name', recipient_account: '$_id.recipient_account' } },
+    ]);
     res.json({ recipients });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to retrieve recipients.' });
+  } catch (err: any) {
+    res.status(500).json({ error: errorMessage(err, 'Failed to retrieve recipients.') });
   }
 });
 

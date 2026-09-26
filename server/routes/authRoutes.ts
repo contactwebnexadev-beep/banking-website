@@ -1,6 +1,7 @@
 import { Router, Response } from 'express';
 import bcrypt from 'bcryptjs';
-import { get, query, run, getDatabase } from '../db.js';
+import { User, Account, VerificationCode, AuditLog } from '../models.js';
+import { errorMessage, requireDatabase } from '../db.js';
 import {
   signAuthToken,
   signTemp2FAToken,
@@ -12,6 +13,7 @@ import {
 } from '../auth.js';
 
 const router = Router();
+router.use(requireDatabase);
 
 function maskEmail(email: string): string {
   const parts = email.split('@');
@@ -39,7 +41,7 @@ router.post('/login', async (req, res): Promise<void> => {
       return;
     }
 
-    const user = get<any>('SELECT * FROM users WHERE LOWER(email) = LOWER(?)', [email.trim()]);
+    const user = await User.findOne({ email: String(email).trim().toLowerCase() }).select('+password_hash').lean<any>();
     if (!user) {
       res.status(401).json({ error: 'The Online ID or Passcode entered does not match our records.' });
       return;
@@ -63,11 +65,11 @@ router.post('/login', async (req, res): Promise<void> => {
     const otpId = 'otp_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
     const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
 
-    run(
-      `INSERT INTO verification_codes (id, user_id, email, phone, code, purpose, expires_at, verified, created_at)
-       VALUES (?, ?, ?, ?, ?, 'login', ?, 0, ?)`,
-      [otpId, user.id, user.email, user.phone, otpCode, expiresAt, Date.now()]
-    );
+    await VerificationCode.create({
+      id: otpId, user_id: user.id, email: user.email, phone: user.phone,
+      code: otpCode, purpose: 'login', expires_at: expiresAt,
+      verified: false, created_at: Date.now(),
+    });
 
     const tempToken = signTemp2FAToken({
       id: user.id,
@@ -90,7 +92,7 @@ router.post('/login', async (req, res): Promise<void> => {
     });
   } catch (err: any) {
     console.error('Login error:', err);
-    res.status(500).json({ error: 'Internal server error during authentication.' });
+    res.status(500).json({ error: errorMessage(err, 'Internal server error during authentication.') });
   }
 });
 
@@ -110,12 +112,9 @@ router.post('/verify-2fa', async (req, res): Promise<void> => {
       return;
     }
 
-    const record = get<any>(
-      `SELECT * FROM verification_codes 
-       WHERE user_id = ? AND purpose = 'login' AND verified = 0 AND expires_at > ?
-       ORDER BY created_at DESC LIMIT 1`,
-      [payload.id, Date.now()]
-    );
+    const record = await VerificationCode.findOne({
+      user_id: payload.id, purpose: 'login', verified: false, expires_at: { $gt: Date.now() },
+    }).sort({ created_at: -1 }).lean<any>();
 
     if (!record || record.code !== code.trim()) {
       res.status(400).json({ error: 'Invalid verification code. Please check your code and try again.' });
@@ -123,9 +122,9 @@ router.post('/verify-2fa', async (req, res): Promise<void> => {
     }
 
     // Mark verified
-    run('UPDATE verification_codes SET verified = 1 WHERE id = ?', [record.id]);
+    await VerificationCode.updateOne({ id: record.id }, { $set: { verified: true } });
 
-    const user = get<any>('SELECT id, email, full_name, role, phone FROM users WHERE id = ?', [payload.id]);
+    const user = await User.findOne({ id: payload.id }).select('id email full_name role phone').lean<any>();
     if (!user) {
       res.status(404).json({ error: 'User profile not found.' });
       return;
@@ -161,7 +160,7 @@ router.post('/verify-2fa', async (req, res): Promise<void> => {
     });
   } catch (err: any) {
     console.error('2FA verification error:', err);
-    res.status(500).json({ error: 'Verification processing failed.' });
+    res.status(500).json({ error: errorMessage(err, 'Verification processing failed.') });
   }
 });
 
@@ -180,7 +179,7 @@ router.post('/resend-otp', async (req, res): Promise<void> => {
       return;
     }
 
-    const user = get<any>('SELECT * FROM users WHERE id = ?', [payload.id]);
+    const user = await User.findOne({ id: payload.id }).lean<any>();
     if (!user) {
       res.status(404).json({ error: 'User not found.' });
       return;
@@ -190,11 +189,11 @@ router.post('/resend-otp', async (req, res): Promise<void> => {
     const otpId = 'otp_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
     const expiresAt = Date.now() + 10 * 60 * 1000;
 
-    run(
-      `INSERT INTO verification_codes (id, user_id, email, phone, code, purpose, expires_at, verified, created_at)
-       VALUES (?, ?, ?, ?, ?, 'login', ?, 0, ?)`,
-      [otpId, user.id, user.email, user.phone, otpCode, expiresAt, Date.now()]
-    );
+    await VerificationCode.create({
+      id: otpId, user_id: user.id, email: user.email, phone: user.phone,
+      code: otpCode, purpose: 'login', expires_at: expiresAt,
+      verified: false, created_at: Date.now(),
+    });
 
     res.json({
       success: true,
@@ -205,22 +204,26 @@ router.post('/resend-otp', async (req, res): Promise<void> => {
     });
   } catch (err: any) {
     console.error('Resend OTP error:', err);
-    res.status(500).json({ error: 'Failed to dispatch new verification code.' });
+    res.status(500).json({ error: errorMessage(err, 'Failed to dispatch new verification code.') });
   }
 });
 
 // GET /api/auth/me
-router.get('/me', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-  if (!req.user) {
-    res.status(401).json({ error: 'Not authenticated' });
-    return;
+router.get('/me', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
+    }
+    const user = await User.findOne({ id: req.user.id }).select('id email full_name role phone').lean<any>();
+    if (!user) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+    res.json({ user: { ...user, role: isAdminRole(user.role) ? 'admin' : 'user' } });
+  } catch (err: any) {
+    res.status(500).json({ error: errorMessage(err, 'Failed to retrieve user profile.') });
   }
-  const user = get<any>('SELECT id, email, full_name, role, phone FROM users WHERE id = ?', [req.user.id]);
-  if (!user) {
-    res.status(404).json({ error: 'User not found' });
-    return;
-  }
-  res.json({ user: { ...user, role: isAdminRole(user.role) ? 'admin' : 'user' } });
 });
 
 // POST /api/auth/logout
@@ -255,19 +258,19 @@ router.post('/register', async (req, res): Promise<void> => {
     }
 
     const cleanEmail = String(email).trim().toLowerCase();
-    const cleanName = String(fullName).trim();
+    const cleanName = String(fullName || chosenName).trim();
     const cleanPhone = String(phone).trim();
     const pin = securityPin ? String(securityPin).trim() : '1234';
 
     // 1. Check if user already exists (with try/catch)
     let existing: any = null;
     try {
-      existing = get<any>('SELECT id FROM users WHERE LOWER(email) = ?', [cleanEmail]);
+      existing = await User.exists({ email: cleanEmail });
     } catch (checkErr: any) {
       console.error('Database query error checking existing user:', checkErr);
-      res.status(400).json({
+      res.status(500).json({
         success: false,
-        error: 'Database error validating email uniqueness. Please try again.'
+        error: errorMessage(checkErr, 'Database error validating email uniqueness.')
       });
       return;
     }
@@ -281,57 +284,21 @@ router.post('/register', async (req, res): Promise<void> => {
     }
 
     const userId = 'usr_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
-    const passwordHash = bcrypt.hashSync(password, 10);
+    const passwordHash = bcrypt.hashSync(chosenPassword, 10);
     const createdAt = new Date().toISOString();
+    const pinHash = bcrypt.hashSync(pin, 10);
 
-    // 2. Specific SQLite user insertion with robust try/catch & fallback
-    let userInserted = false;
     try {
-      run(
-        `INSERT INTO users (id, email, password_hash, full_name, role, phone, security_pin, created_at)
-         VALUES (?, ?, ?, ?, 'user', ?, ?, ?)`,
-        [userId, cleanEmail, passwordHash, cleanName, cleanPhone, pin, createdAt]
-      );
-      userInserted = true;
+      await User.create({
+        id: userId, email: cleanEmail, password_hash: passwordHash,
+        full_name: cleanName, role: 'user', phone: cleanPhone,
+        security_pin: pinHash, created_at: createdAt,
+      });
     } catch (dbInsertErr: any) {
-      console.warn('Initial SQLite insert with security_pin failed, attempting table alter or fallback:', dbInsertErr);
-      try {
-        const db = getDatabase();
-        try {
-          db.run("ALTER TABLE users ADD COLUMN security_pin TEXT;");
-        } catch {
-          // Column might already exist or table issue
-        }
-        run(
-          `INSERT INTO users (id, email, password_hash, full_name, role, phone, security_pin, created_at)
-           VALUES (?, ?, ?, ?, 'user', ?, ?, ?)`,
-          [userId, cleanEmail, passwordHash, cleanName, cleanPhone, pin, createdAt]
-        );
-        userInserted = true;
-      } catch (retryErr: any) {
-        // Fallback without security_pin if necessary
-        try {
-          run(
-            `INSERT INTO users (id, email, password_hash, full_name, role, phone, created_at)
-             VALUES (?, ?, ?, ?, 'user', ?, ?)`,
-            [userId, cleanEmail, passwordHash, cleanName, cleanPhone, createdAt]
-          );
-          userInserted = true;
-        } catch (finalUserErr: any) {
-          console.error('SQLite user insertion fatal error:', finalUserErr);
-          res.status(400).json({
-            success: false,
-            error: 'Failed to create user record in database: ' + (finalUserErr?.message || 'Database error')
-          });
-          return;
-        }
-      }
-    }
-
-    if (!userInserted) {
-      res.status(400).json({
+      console.error('MongoDB user insertion failed:', dbInsertErr);
+      res.status(500).json({
         success: false,
-        error: 'Could not complete user registration in database.'
+        error: errorMessage(dbInsertErr, 'Could not complete user registration in database.')
       });
       return;
     }
@@ -343,14 +310,7 @@ router.post('/register', async (req, res): Promise<void> => {
     while (!isUnique && attempts < 15) {
       attempts++;
       accNum = '48' + Math.floor(10000000 + Math.random() * 90000000).toString();
-      try {
-        const existingAcc = get('SELECT id FROM accounts WHERE account_number = ?', [accNum]);
-        if (!existingAcc) {
-          isUnique = true;
-        }
-      } catch {
-        isUnique = true;
-      }
+      isUnique = !(await Account.exists({ account_number: accNum }));
     }
     if (!accNum || !isUnique) {
       accNum = '48' + Date.now().toString().slice(-8);
@@ -361,16 +321,19 @@ router.post('/register', async (req, res): Promise<void> => {
 
     // 4. Create primary Advantage Plus Checking Account (with try/catch)
     try {
-      run(
-        `INSERT INTO accounts (id, user_id, account_number, account_type, nickname, balance, currency, routing_number, status, created_at)
-         VALUES (?, ?, ?, 'Checking', 'Advantage Plus Checking', 0.00, 'USD', ?, 'Active', ?)`,
-        [accountId, userId, accNum, routingNumber, createdAt]
-      );
+      await Account.create({
+        id: accountId, user_id: userId, account_number: accNum,
+        account_type: 'Checking', nickname: 'Advantage Plus Checking',
+        balance: 0, currency: 'USD', routing_number: routingNumber,
+        status: 'Active', created_at: createdAt,
+      });
+      await User.updateOne({ id: userId }, { $set: { account_number: accNum } });
     } catch (accErr: any) {
-      console.error('SQLite account insertion error:', accErr);
-      res.status(400).json({
+      console.error('MongoDB account insertion error:', accErr);
+      await User.deleteOne({ id: userId });
+      res.status(500).json({
         success: false,
-        error: 'User created, but failed to open initial checking account: ' + (accErr?.message || 'Database error')
+        error: errorMessage(accErr, 'Failed to open the initial checking account.')
       });
       return;
     }
@@ -378,11 +341,12 @@ router.post('/register', async (req, res): Promise<void> => {
     // 5. Record initial ledger audit log (non-fatal try/catch)
     try {
       const auditId = 'aud_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
-      run(
-        `INSERT INTO audit_logs (id, admin_id, admin_email, action, target_user_id, target_account_id, amount, details, created_at)
-         VALUES (?, 'system', 'system@bankofamerica.com', 'ACCOUNT_OPENED', ?, ?, 0.00, 'Self-service online registration and Advantage Checking opened ($0.00 USD)', ?)`,
-        [auditId, userId, accountId, createdAt]
-      );
+      await AuditLog.create({
+        id: auditId, admin_id: 'system', admin_email: 'system@bankofamerica.com',
+        action: 'ACCOUNT_OPENED', target_user_id: userId, target_account_id: accountId,
+        amount: 0, details: 'Self-service online registration and Advantage Checking opened ($0.00 USD)',
+        created_at: createdAt,
+      });
     } catch (auditErr) {
       console.warn('Non-fatal audit log error during registration:', auditErr);
     }
@@ -435,9 +399,11 @@ router.post('/register', async (req, res): Promise<void> => {
   } catch (err: any) {
     console.error('Registration processing unexpected error:', err);
     if (!res.headersSent) {
-      res.status(400).json({
+      res.status(500).json({
         success: false,
-        error: err?.message || 'Failed to process online registration. Please try again later.'
+        error: typeof err?.message === 'string' && err.message.trim()
+          ? err.message
+          : errorMessage(err, 'Failed to process online registration. Please try again later.')
       });
     }
   }
